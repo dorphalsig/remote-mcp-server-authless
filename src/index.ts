@@ -3,20 +3,45 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 interface Env {
-  RESULTS_PER_CATEGORY?: string; // text var
+  RESULTS_PER_CATEGORY?: string; // text var (default "5")
   GITHUB_TOKEN?: string;         // secret
 }
 
-// --- simple module-scoped context (single-user, minimal) ---
+/** ---------- tiny helpers ---------- **/
+const firstLine = (s?: string) => (s || "").split("\n")[0] || "";
+
+async function safeJson<T = any>(res: Response): Promise<T | null> {
+  const txt = await res.text();
+  try { return JSON.parse(txt) as T; }
+  catch {
+    console.warn("[GitHub] Non-JSON response", res.status, txt.slice(0, 200));
+    return null;
+  }
+}
+
+function ownerRepoFromPath(pathname: string): { owner: string; repo: string } | null {
+  // expect: /:owner/:repo/sse, /:owner/:repo/sse/message, or /:owner/:repo/mcp
+  const parts = pathname.split("/").filter(Boolean);
+  if (parts.length >= 3 && (parts[2] === "sse" || parts[2] === "mcp")) {
+    return { owner: parts[0], repo: parts[1] };
+  }
+  if (parts.length >= 4 && parts[2] === "sse" && parts[3] === "message") {
+    return { owner: parts[0], repo: parts[1] };
+  }
+  return null;
+}
+
+/** ---------- per-request state (simple & single-user) ---------- **/
 let CURRENT_OWNER = "";
 let CURRENT_REPO = "";
 let RESULTS_LIMIT = 5;
-let GH_HEADERS: Record<string, string> = { Accept: "application/vnd.github+json" };
+let GH_HEADERS: Record<string, string> = {
+  Accept: "application/vnd.github+json",
+  "X-GitHub-Api-Version": "2022-11-28", // recommended by GitHub
+  "User-Agent": "mcp-worker",           // GitHub requires a User-Agent
+};
 
-// Util
-const firstLine = (s?: string) => (s || "").split("\n")[0] || "";
-
-// Define our MCP agent with tools (follows your pattern)
+/** ---------- MCP Agent using your exact template shape ---------- **/
 export class MyMCP extends McpAgent {
   server = new McpServer({
     name: "GitHub Repo Search",
@@ -24,9 +49,11 @@ export class MyMCP extends McpAgent {
   });
 
   async init() {
-    // --- Tool: search ---
-    // Args: a single string query
-    // Returns: content[ { type:"text", text: JSON.stringify({ results: [{id,title,url}...] }) } ]
+    /** --------- search tool ---------
+     * Args: (string) query
+     * Returns: content: [{ type: "text", text: JSON.stringify({ results: [{id,title,url}...] }) }]
+     * Searches PRs, issues, commits, and code within repo from the URL.
+     */
     this.server.tool(
       "search",
       z.string().describe("Query string to search within the repository"),
@@ -46,19 +73,20 @@ export class MyMCP extends McpAgent {
         };
 
         const [ri, rp, rc, rcode] = await Promise.all([
-          fetch(urls.issues, { headers: GH_HEADERS }),
-          fetch(urls.prs,    { headers: GH_HEADERS }),
-          fetch(urls.commits,{ headers: GH_HEADERS }),
-          fetch(urls.code,   { headers: GH_HEADERS }),
+          fetch(urls.issues,  { headers: GH_HEADERS }),
+          fetch(urls.prs,     { headers: GH_HEADERS }),
+          fetch(urls.commits, { headers: GH_HEADERS }),
+          fetch(urls.code,    { headers: GH_HEADERS }),
         ]);
 
-        const [ji, jp, jc, jcode] = await Promise.all([
-          ri.json(), rp.json(), rc.json(), rcode.json(),
-        ]);
+        const ji = (await safeJson<any>(ri))    ?? { items: [] };
+        const jp = (await safeJson<any>(rp))    ?? { items: [] };
+        const jc = (await safeJson<any>(rc))    ?? { items: [] };
+        const jcode = (await safeJson<any>(rcode)) ?? { items: [] };
 
         const results: Array<{ id: string; title: string; url: string }> = [];
 
-        // Issues (prefix issue:)
+        // Issues (prefix: issue:)
         for (const it of ji.items ?? []) {
           results.push({
             id: `issue:${it.number}`,
@@ -67,7 +95,7 @@ export class MyMCP extends McpAgent {
           });
         }
 
-        // PRs (prefix pr:)
+        // PRs (prefix: pr:)
         for (const it of jp.items ?? []) {
           results.push({
             id: `pr:${it.number}`,
@@ -76,7 +104,7 @@ export class MyMCP extends McpAgent {
           });
         }
 
-        // Commits (prefix commit:)
+        // Commits (prefix: commit:)
         for (const it of jc.items ?? []) {
           const sha = it.sha ?? it.hash ?? "";
           const title = firstLine(it.commit?.message) || `Commit ${sha.slice(0, 7)}`;
@@ -87,7 +115,7 @@ export class MyMCP extends McpAgent {
           });
         }
 
-        // Code (prefix code:)
+        // Code (prefix: code:)
         for (const it of jcode.items ?? []) {
           const sha = it.sha ?? "";
           const path = it.path ?? it.name ?? sha;
@@ -104,9 +132,10 @@ export class MyMCP extends McpAgent {
       }
     );
 
-    // --- Tool: fetch ---
-    // Args: a single string ID with a type prefix (issue:/pr:/commit:/code:)
-    // Returns: content[ { type:"text", text: JSON.stringify({ id,title,text,url,metadata }) } ]
+    /** --------- fetch tool ---------
+     * Args: (string) id with type prefix (issue:N | pr:N | commit:SHA | code:SHA)
+     * Returns: content: [{ type: "text", text: JSON.stringify({ id,title,text,url,metadata }) }]
+     */
     this.server.tool(
       "fetch",
       z.string().describe("Prefixed ID from `search`: issue:<n> | pr:<n> | commit:<sha> | code:<sha>"),
@@ -126,7 +155,7 @@ export class MyMCP extends McpAgent {
         if (prefix === "issue") {
           const u = `https://api.github.com/repos/${owner}/${repo}/issues/${rest}`;
           const r = await fetch(u, { headers: GH_HEADERS });
-          const j = await r.json();
+          const j = (await safeJson<any>(r)) ?? {};
           doc = {
             id,
             title: j.title ?? `Issue #${rest}`,
@@ -137,7 +166,7 @@ export class MyMCP extends McpAgent {
         } else if (prefix === "pr") {
           const u = `https://api.github.com/repos/${owner}/${repo}/pulls/${rest}`;
           const r = await fetch(u, { headers: GH_HEADERS });
-          const j = await r.json();
+          const j = (await safeJson<any>(r)) ?? {};
           doc = {
             id,
             title: j.title ?? `PR #${rest}`,
@@ -155,7 +184,7 @@ export class MyMCP extends McpAgent {
           const sha = rest;
           const u = `https://api.github.com/repos/${owner}/${repo}/commits/${sha}`;
           const r = await fetch(u, { headers: GH_HEADERS });
-          const j = await r.json();
+          const j = (await safeJson<any>(r)) ?? {};
           const message: string = j?.commit?.message ?? "";
           const title = firstLine(message) || `Commit ${sha.slice(0, 7)}`;
           doc = {
@@ -169,7 +198,7 @@ export class MyMCP extends McpAgent {
           const sha = rest;
           const u = `https://api.github.com/repos/${owner}/${repo}/git/blobs/${sha}`;
           const r = await fetch(u, { headers: GH_HEADERS });
-          const j = await r.json();
+          const j = (await safeJson<any>(r)) ?? {};
           let text = "";
           if (j?.content && j?.encoding === "base64") {
             text = atob(String(j.content).replace(/\n/g, ""));
@@ -178,7 +207,7 @@ export class MyMCP extends McpAgent {
             id,
             title: `blob ${sha}`,
             text,
-            url: u, // API URL; no canonical html for raw blob SHA
+            url: u, // API URL; blobs by SHA don't have a canonical html_url
             metadata: { size: j.size, encoding: j.encoding, sha },
           };
         } else {
@@ -197,50 +226,48 @@ export class MyMCP extends McpAgent {
   }
 }
 
-// --- Worker entry that mirrors your example, but under /:owner/:repo/ ---
+/** ---------- Worker entry that mirrors your example, but under /:owner/:repo/ ---------- **/
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
     const url = new URL(request.url);
-    const parts = url.pathname.split("/").filter(Boolean); // e.g. ["owner","repo","sse"] or ["owner","repo","sse","message"]
+    const params = ownerRepoFromPath(url.pathname);
 
-    // Only accept /:owner/:repo/(sse|sse/message|mcp)
-    const isRepoScoped =
-      (parts.length === 3 && (parts[2] === "sse" || parts[2] === "mcp")) ||
-      (parts.length === 4 && parts[2] === "sse" && parts[3] === "message");
-
-    if (!isRepoScoped) {
+    // Only accept /:owner/:repo/(sse|sse/message|mcp); else 404
+    if (!params) {
       return new Response("Not found", { status: 404 });
     }
 
-    // --- set the per-request repo + env (simple single-user globals) ---
-    CURRENT_OWNER = parts[0];
-    CURRENT_REPO = parts[1];
+    // set per-request repo + env
+    CURRENT_OWNER = params.owner;
+    CURRENT_REPO = params.repo;
 
-    // env -> limit + token headers; log what we read
     const rawLimit = env.RESULTS_PER_CATEGORY ?? "5";
-    const n = Number.parseInt(rawLimit, 10);
-    RESULTS_LIMIT = Number.isFinite(n) && n > 0 ? n : 5;
+    const parsed = Number.parseInt(rawLimit, 10);
+    RESULTS_LIMIT = Number.isFinite(parsed) && parsed > 0 ? parsed : 5;
 
-    // reset headers each request
-    GH_HEADERS = { Accept: "application/vnd.github+json" };
+    GH_HEADERS = {
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "mcp-worker",
+    };
     if (env.GITHUB_TOKEN) GH_HEADERS.Authorization = `Bearer ${env.GITHUB_TOKEN}`;
 
+    // log env values read (no secrets leaked)
     console.log("[MCP] owner/repo:", `${CURRENT_OWNER}/${CURRENT_REPO}`);
     console.log("[MCP] RESULTS_PER_CATEGORY:", RESULTS_LIMIT);
     console.log("[MCP] GITHUB_TOKEN present:", Boolean(env.GITHUB_TOKEN));
 
-    // --- route exactly like your example, but with dynamic prefix ---
     const prefix = `/${CURRENT_OWNER}/${CURRENT_REPO}`;
-    if (
-      url.pathname === `${prefix}/sse` ||
-      url.pathname === `${prefix}/sse/message`
-    ) {
-      // @ts-ignore — method provided by Cloudflare Agents SDK
+
+    if (url.pathname === `${prefix}/sse` || url.pathname === `${prefix}/sse/message`) {
+      // Serve SSE per your template
+      // @ts-ignore method provided by the Cloudflare Agents SDK
       return MyMCP.serveSSE(`${prefix}/sse`).fetch(request, env, ctx);
     }
 
     if (url.pathname === `${prefix}/mcp`) {
-      // @ts-ignore — method provided by Cloudflare Agents SDK
+      // Optional RPC endpoint per your template
+      // @ts-ignore method provided by the Cloudflare Agents SDK
       return MyMCP.serve(`${prefix}/mcp`).fetch(request, env, ctx);
     }
 
