@@ -60,10 +60,35 @@ export class MyMCP extends McpAgent {
     return `${base}${path}${q}`;
   }
 
-  private async ghGet(url: string): Promise<any> {
-    const r = await fetch(url, { headers: HEADERS });
-    return r.json();
+private async ghGet(url: string): Promise<any> {
+  const res = await fetch(url, { headers: HEADERS });
+
+  // Read body once; we’ll decide how to interpret it.
+  const text = await res.text();
+  const ct = res.headers.get("content-type") || "";
+
+  // Non-JSON body (e.g., "Request forbidden by administrative rules.")
+  if (!ct.includes("application/json")) {
+    const head = text.trim().slice(0, 300);
+    throw new Error(`GitHub ${res.status} ${res.statusText}: ${head}`);
   }
+
+  // JSON body, but might still be an error
+  let data: any;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    const head = text.trim().slice(0, 300);
+    throw new Error(`GitHub ${res.status} ${res.statusText}: ${head}`);
+  }
+
+  if (!res.ok) {
+    const msg = (data && (data.message || data.error)) || text.trim().slice(0, 300);
+    throw new Error(`GitHub ${res.status} ${res.statusText}: ${msg}`);
+  }
+
+  return data;
+}
 
   private safeAtob(b64: string): string {
     try {
