@@ -2,13 +2,13 @@ import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
-static GITHUB_TOKEN?: string;
 type State = {
   index: Record<string, { owner: string; repo: string; path: string; sha?: string; html_url: string }>;
 };
 type Props = { owner: string; repo: string };
 
 export class MyMCP extends McpAgent<Env, State, Props> {
+  static GITHUB_TOKEN?: string;
   server = new McpServer({ name: "github-repo-adapter", version: "1.0.0" });
   initialState: State = { index: {} };
 
