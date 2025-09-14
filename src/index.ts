@@ -3,25 +3,21 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 /**
- * Cloudflare Worker Remote MCP server that exposes GitHub repo tools
- * on per-repository routes: /<owner>/<repo>/(sse|mcp)
+ * Cloudflare Worker Remote MCP server exposing GitHub repo tools on per-repo routes:
+ *   /<owner>/<repo>/(sse|mcp)
  *
- * Tools exposed (all repo-scoped):
- *  - search: code search with optional qualifiers
- *  - fetch: fetch file contents by path or search ids
- *  - list_prs / get_pr / list_pr_commits
- *  - list_commits
- *  - get_commit_status (combined statuses + checks)
- *  - list_workflows / list_workflow_files / get_workflow_file
- *  - list_workflow_runs / get_workflow_run / list_run_jobs
+ * Tools:
+ *  - search: code search (uses GitHub Search API) with snippets
+ *  - fetch: fetch file contents by search IDs (blob) or by explicit path (contents)
+ *  - list_prs, get_pr, list_pr_commits
+ *  - list_commits, get_commit_status, list_check_runs
+ *  - list_workflows, list_workflow_files, get_workflow_file
+ *  - list_workflow_runs, get_workflow_run, list_run_jobs
  *
- * Authentication to GitHub is via the environment secret GITHUB_TOKEN (optional for public repos).
- * If set, we include Authorization: Bearer <token> and X-GitHub-Api-Version headers on all requests.
+ * Auth: set secret GITHUB_TOKEN on the Worker (fine‑grained PAT, read‑only). For public repos it's optional.
  */
 
-type Env = {
-  GITHUB_TOKEN?: string;
-};
+type Env = { GITHUB_TOKEN?: string };
 
 type State = {
   index: Record<string, { owner: string; repo: string; path: string; sha?: string; html_url: string }>;
@@ -29,14 +25,13 @@ type State = {
 
 type Props = { owner: string; repo: string };
 
-// --------- Utility helpers ---------
 const GH_API = "https://api.github.com";
 
-function ghHeaders(env: Env, accept: string = "application/vnd.github+json"): Record<string, string> {
+function ghHeaders(env: Env, accept = "application/vnd.github+json"): Record<string, string> {
   const h: Record<string, string> = {
     Accept: accept,
     "X-GitHub-Api-Version": "2022-11-28",
-    "User-Agent": "mcp-github-repo-adapter/1.0 (+cloudflare-workers)",
+    "User-Agent": "mcp-github-repo-adapter/1.1 (+cloudflare-workers)",
   };
   if (env.GITHUB_TOKEN) h.Authorization = `Bearer ${env.GITHUB_TOKEN}`;
   return h;
@@ -46,7 +41,8 @@ async function ghJson<T>(env: Env, url: string, accept?: string): Promise<T> {
   const r = await fetch(url, { headers: ghHeaders(env, accept) });
   if (!r.ok) {
     const body = await r.text().catch(() => "");
-    throw new Error(`GitHub API ${r.status} ${r.statusText} for ${url}${body ? `\n${body}` : ""}`);
+    throw new Error(`GitHub API ${r.status} ${r.statusText} for ${url}${body ? `
+${body}` : ""}`);
   }
   return (await r.json()) as T;
 }
@@ -63,30 +59,37 @@ function q(params: Record<string, string | number | boolean | undefined>): strin
   return usp.toString();
 }
 
-// --------- MCP Agent ---------
 export class MyMCP extends McpAgent<Env, State, Props> {
-  server = new McpServer({ name: "github-repo-adapter", version: "1.0.0" });
+  server = new McpServer({ name: "github-repo-adapter", version: "1.1.0" });
   initialState: State = { index: {} };
 
   async init() {
-    // --- search (code search within repo) ---
+    // ---------- SEARCH ----------
     this.server.tool(
       "search",
-      z.object({
-        query: z.string().describe("Search string"),
-        path: z.string().optional(),
-        language: z.string().optional(),
-        filename: z.string().optional(),
-        extension: z.string().optional(),
-        subset: z.enum(["code", "docs"]).optional().default("code"),
-        per_page: z.number().int().min(1).max(50).optional().default(10),
-        page: z.number().int().min(1).max(10).optional().default(1),
-      }),
-      async ($1) => {
+      "Search code in this repo and return IDs usable by fetch(). Accepts a single parameter: { query: string }.",
+      {
+        query: z.string().describe("Search string with optional GitHub qualifiers (e.g., path:src language:ts)")
+      },
+      async ({ query }) => {
         const { owner, repo } = this.props;
-        const { query, path, language, filename, extension, subset, per_page, page } = args;
-        const quals: string[] = [`repo:${owner}/${repo}`, "in:file"];
-        if (path) quals.push(`path:${path}`);
+        const qstr = encodeURIComponent([query, `repo:${owner}/${repo}`, "in:file"].join(" "));
+        const url = `${GH_API}/search/code?q=${qstr}`;
+        const data = await ghJson<any>(this.env, url, "application/vnd.github.text-match+json");
+        const results = (data.items ?? []).map((it: any) => {
+          const id = it.sha as string;
+          this.state.index[id] = { owner, repo, path: it.path, sha: it.sha, html_url: it.html_url };
+          return {
+            id,
+            title: `${it.repository?.full_name ?? `${owner}/${repo}`}/${it.path}`,
+            url: it.html_url,
+            path: it.path,
+            snippet: it.text_matches?.[0]?.fragment,
+          };
+        });
+        return { content: [{ type: "json", json: { results } }] };
+      }
+    );
         if (language) quals.push(`language:${language}`);
         if (filename) quals.push(`filename:${filename}`);
         if (extension) quals.push(`extension:${extension}`);
@@ -109,30 +112,39 @@ export class MyMCP extends McpAgent<Env, State, Props> {
       }
     );
 
-    // --- fetch (by ids or by explicit path) ---
+    // ---------- FETCH ----------
     this.server.tool(
       "fetch",
-      z.object({
-        ids: z.array(z.string()).optional(),
-        path: z.string().optional(),
-        ref: z.string().optional().default("HEAD"),
-      }),
-      async ($1) => {
+      "Fetch file contents for a list of IDs or paths returned by search(). Accepts a single parameter: { ids: string[] }.",
+      {
+        ids: z.array(z.string()).describe("IDs returned by search (preferred) or repo-relative file paths").nonempty()
+      },
+      async ({ ids })) => {
         const { owner, repo } = this.props;
         const out: Array<{ path: string; source_url: string; content: string }> = [];
 
-        // by IDs → Git Blob API (raw)
-        if (args.ids?.length) {
-          for (const id of args.ids) {
-            const meta = this.state.index[id];
-            if (!meta?.sha) continue;
+        for (const token of ids) {
+          const meta = this.state.index[token];
+          if (meta?.sha) {
+            // Treat as blob SHA from search
             const blobUrl = `${GH_API}/repos/${owner}/${repo}/git/blobs/${meta.sha}`;
             const content = await ghText(this.env, blobUrl, "application/vnd.github.raw+json");
+            out.push({ path: meta.path, source_url: meta.html_url, content });
+            continue;
+          }
+          // Otherwise treat token as a path
+          const url = `${GH_API}/repos/${owner}/${repo}/contents/${encodeURIComponent(token)}?ref=HEAD`;
+          const content = await ghText(this.env, url, "application/vnd.github.raw+json");
+          out.push({ path: token, source_url: `https://github.com/${owner}/${repo}/blob/HEAD/${token}`, content });
+        }
+
+        return { content: [{ type: "json", json: { files: out } }] };
+      }
+    );
             out.push({ path: meta.path, source_url: meta.html_url, content });
           }
         }
 
-        // by path → Contents API (raw)
         if (args.path) {
           const url = `${GH_API}/repos/${owner}/${repo}/contents/${encodeURIComponent(args.path)}?${q({ ref: args.ref })}`;
           const content = await ghText(this.env, url, "application/vnd.github.raw+json");
@@ -143,10 +155,11 @@ export class MyMCP extends McpAgent<Env, State, Props> {
       }
     );
 
-    // --- Pull Requests ---
+    // ---------- PULL REQUESTS ----------
     this.server.tool(
       "list_prs",
-      z.object({
+      "List pull requests for this repo.",
+      {
         state: z.enum(["open", "closed", "all"]).optional().default("open"),
         head: z.string().optional(),
         base: z.string().optional(),
@@ -154,8 +167,8 @@ export class MyMCP extends McpAgent<Env, State, Props> {
         direction: z.enum(["asc", "desc"]).optional(),
         per_page: z.number().int().min(1).max(100).optional().default(30),
         page: z.number().int().min(1).max(50).optional().default(1),
-      }),
-      async ($1) => {
+      },
+      async (args) => {
         const { owner, repo } = this.props;
         const url = `${GH_API}/repos/${owner}/${repo}/pulls?${q(args as any)}`;
         const items = await ghJson<any[]>(this.env, url);
@@ -179,8 +192,9 @@ export class MyMCP extends McpAgent<Env, State, Props> {
 
     this.server.tool(
       "get_pr",
-      z.object({ number: z.number().int() }),
-      async ($1) => {
+      "Get a single pull request by number.",
+      { number: z.number().int() },
+      async ({ number }) => {
         const { owner, repo } = this.props;
         const p = await ghJson<any>(this.env, `${GH_API}/repos/${owner}/${repo}/pulls/${number}`);
         const pr = {
@@ -204,8 +218,9 @@ export class MyMCP extends McpAgent<Env, State, Props> {
 
     this.server.tool(
       "list_pr_commits",
-      z.object({ number: z.number().int(), per_page: z.number().int().min(1).max(100).optional().default(30), page: z.number().int().min(1).max(50).optional().default(1) }),
-      async ($1) => {
+      "List commits that belong to a PR.",
+      { number: z.number().int(), per_page: z.number().int().min(1).max(100).optional().default(30), page: z.number().int().min(1).max(50).optional().default(1) },
+      async ({ number, per_page, page }) => {
         const { owner, repo } = this.props;
         const url = `${GH_API}/repos/${owner}/${repo}/pulls/${number}/commits?${q({ per_page, page })}`;
         const items = await ghJson<any[]>(this.env, url);
@@ -220,10 +235,11 @@ export class MyMCP extends McpAgent<Env, State, Props> {
       }
     );
 
-    // --- Commits ---
+    // ---------- COMMITS / STATUSES ----------
     this.server.tool(
       "list_commits",
-      z.object({
+      "List commits on a branch or for the repo.",
+      {
         sha: z.string().optional(),
         path: z.string().optional(),
         author: z.string().optional(),
@@ -231,8 +247,8 @@ export class MyMCP extends McpAgent<Env, State, Props> {
         until: z.string().optional(),
         per_page: z.number().int().min(1).max(100).optional().default(30),
         page: z.number().int().min(1).max(50).optional().default(1),
-      }),
-      async ($1) => {
+      },
+      async (args) => {
         const { owner, repo } = this.props;
         const url = `${GH_API}/repos/${owner}/${repo}/commits?${q(args as any)}`;
         const items = await ghJson<any[]>(this.env, url);
@@ -249,22 +265,23 @@ export class MyMCP extends McpAgent<Env, State, Props> {
 
     this.server.tool(
       "get_commit_status",
-      z.object({ ref: z.string().describe("Commit SHA, branch name, or tag") }),
-      async ($1) => {
+      "Get combined commit status + checks + recent workflow runs for a ref.",
+      { ref: z.string().describe("Commit SHA, branch name, or tag") },
+      async ({ ref }) => {
         const { owner, repo } = this.props;
         const combined = await ghJson<any>(this.env, `${GH_API}/repos/${owner}/${repo}/commits/${encodeURIComponent(ref)}/status`);
         const checks = await ghJson<any>(this.env, `${GH_API}/repos/${owner}/${repo}/commits/${encodeURIComponent(ref)}/check-runs`);
         const workflows = await ghJson<any>(this.env, `${GH_API}/repos/${owner}/${repo}/actions/runs?${q({ head_sha: ref, per_page: 10 })}`);
         const result = {
-          state: combined.state, // success | failure | pending | error
-          statuses: combined.statuses?.map((s: any) => ({
+          state: combined.state,
+          statuses: (combined.statuses ?? []).map((s: any) => ({
             context: s.context,
             state: s.state,
             description: s.description,
             target_url: s.target_url,
             created_at: s.created_at,
             updated_at: s.updated_at,
-          })) ?? [],
+          })),
           checks: (checks.check_runs ?? []).map((r: any) => ({
             id: r.id,
             name: r.name,
@@ -293,11 +310,23 @@ export class MyMCP extends McpAgent<Env, State, Props> {
       }
     );
 
-    // --- Actions: workflows and runs ---
+    this.server.tool(
+      "list_check_runs",
+      "List check runs for a commit ref.",
+      { ref: z.string() },
+      async ({ ref }) => {
+        const { owner, repo } = this.props;
+        const data = await ghJson<any>(this.env, `${GH_API}/repos/${owner}/${repo}/commits/${encodeURIComponent(ref)}/check-runs`);
+        return { content: [{ type: "json", json: data }] };
+      }
+    );
+
+    // ---------- ACTIONS ----------
     this.server.tool(
       "list_workflows",
-      z.object({}),
-      async ($1) => {
+      "List Actions workflows in this repo.",
+      {},
+      async () => {
         const { owner, repo } = this.props;
         const data = await ghJson<any>(this.env, `${GH_API}/repos/${owner}/${repo}/actions/workflows`);
         const workflows = (data.workflows ?? []).map((w: any) => ({
@@ -315,10 +344,10 @@ export class MyMCP extends McpAgent<Env, State, Props> {
 
     this.server.tool(
       "list_workflow_files",
-      z.object({}),
-      async ($1) => {
+      "List files in .github/workflows (YAML).",
+      {},
+      async () => {
         const { owner, repo } = this.props;
-        // List files in .github/workflows (if the directory exists)
         const url = `${GH_API}/repos/${owner}/${repo}/contents/.github/workflows`;
         const entries = await ghJson<any[]>(this.env, url).catch(() => []);
         const files = Array.isArray(entries)
@@ -330,8 +359,9 @@ export class MyMCP extends McpAgent<Env, State, Props> {
 
     this.server.tool(
       "get_workflow_file",
-      z.object({ path: z.string() }),
-      async ($1) => {
+      "Fetch the contents of a workflow YAML path.",
+      { path: z.string() },
+      async ({ path }) => {
         const { owner, repo } = this.props;
         const url = `${GH_API}/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}`;
         const content = await ghText(this.env, url, "application/vnd.github.raw+json");
@@ -341,14 +371,15 @@ export class MyMCP extends McpAgent<Env, State, Props> {
 
     this.server.tool(
       "list_workflow_runs",
-      z.object({
+      "List workflow runs (filterable).",
+      {
         branch: z.string().optional(),
         event: z.string().optional(),
         status: z.string().optional(),
         per_page: z.number().int().min(1).max(100).optional().default(30),
         page: z.number().int().min(1).max(50).optional().default(1),
-      }),
-      async ($1) => {
+      },
+      async (args) => {
         const { owner, repo } = this.props;
         const url = `${GH_API}/repos/${owner}/${repo}/actions/runs?${q(args as any)}`;
         const data = await ghJson<any>(this.env, url);
@@ -371,8 +402,9 @@ export class MyMCP extends McpAgent<Env, State, Props> {
 
     this.server.tool(
       "get_workflow_run",
-      z.object({ run_id: z.number().int() }),
-      async ($1) => {
+      "Get a single workflow run by run_id.",
+      { run_id: z.number().int() },
+      async ({ run_id }) => {
         const { owner, repo } = this.props;
         const wr = await ghJson<any>(this.env, `${GH_API}/repos/${owner}/${repo}/actions/runs/${run_id}`);
         const run = {
@@ -394,8 +426,9 @@ export class MyMCP extends McpAgent<Env, State, Props> {
 
     this.server.tool(
       "list_run_jobs",
-      z.object({ run_id: z.number().int(), per_page: z.number().int().min(1).max(100).optional().default(30), page: z.number().int().min(1).max(50).optional().default(1) }),
-      async ($1) => {
+      "List jobs for a workflow run.",
+      { run_id: z.number().int(), per_page: z.number().int().min(1).max(100).optional().default(30), page: z.number().int().min(1).max(50).optional().default(1) },
+      async ({ run_id, per_page, page }) => {
         const { owner, repo } = this.props;
         const data = await ghJson<any>(this.env, `${GH_API}/repos/${owner}/${repo}/actions/runs/${run_id}/jobs?${q({ per_page, page })}`);
         const jobs = (data.jobs ?? []).map((j: any) => ({
@@ -414,32 +447,20 @@ export class MyMCP extends McpAgent<Env, State, Props> {
   }
 }
 
-// --------- Worker routing ---------
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const { pathname } = new URL(request.url);
-
-    // Expect: /<owner>/<repo>/(sse|mcp)
     const m = pathname.match(/^\/([^/]+)\/([^/]+)\/(sse|mcp)(?:\/.*)?$/);
-    if (!m) {
-      return new Response("Not found. Use /<owner>/<repo>/(sse|mcp)", { status: 404 });
-    }
-
+    if (!m) return new Response("Not found. Use /<owner>/<repo>/(sse|mcp)", { status: 404 });
     const [, ownerEnc, repoEnc, mode] = m;
     const owner = decodeURIComponent(ownerEnc);
     const repo = decodeURIComponent(repoEnc);
 
-    // Pass repo-scoped props into the agent instance
-    // (The Agents SDK reads ctx.props and exposes as this.props)
     (ctx as any).props = { owner, repo } satisfies Props;
-
     const base = `/${owner}/${repo}/${mode}`;
 
-    // Support both transports: SSE and Streamable HTTP
-    if (mode === "sse") {
-      return MyMCP.serveSSE(base).fetch(request, env, ctx);
-    } else {
-      return MyMCP.serve(base).fetch(request, env, ctx);
-    }
+    return mode === "sse"
+      ? MyMCP.serveSSE(base).fetch(request, env, ctx)
+      : MyMCP.serve(base).fetch(request, env, ctx);
   },
 };
