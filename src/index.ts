@@ -2,7 +2,7 @@ import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
-type Env = { GITHUB_TOKEN?: string };
+type Env = { GITHUB_TOKEN: string };
 type State = {
   index: Record<string, { owner: string; repo: string; path: string; sha?: string; html_url: string }>;
 };
