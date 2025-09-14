@@ -8,7 +8,7 @@ type State = {
 };
 type Props = { owner: string; repo: string };
 
-class GitHubRepoAdapter extends McpAgent<Env, State, Props> {
+class MyMCP extends McpAgent<Env, State, Props> {
   server = new McpServer({ name: "github-repo-adapter", version: "1.0.0" });
   initialState: State = { index: {} };
 
