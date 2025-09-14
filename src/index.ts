@@ -2,7 +2,7 @@ import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
-type Env = { GITHUB_TOKEN: string };
+static GITHUB_TOKEN?: string;
 type State = {
   index: Record<string, { owner: string; repo: string; path: string; sha?: string; html_url: string }>;
 };
@@ -46,7 +46,7 @@ export class MyMCP extends McpAgent<Env, State, Props> {
           "Accept": "application/vnd.github.text-match+json",
           "X-GitHub-Api-Version": "2022-11-28",
         };
-        if (env.GITHUB_TOKEN) headers.Authorization = `Bearer ${env.GITHUB_TOKEN}`;
+        if (MyMCP.GITHUB_TOKEN) headers.Authorization = `Bearer ${MyMCP.GITHUB_TOKEN}`;
 
         const r = await fetch(url, { headers });
         if (!r.ok) throw new Error(`GitHub search failed: ${r.status} ${r.statusText}`);
@@ -82,7 +82,7 @@ export class MyMCP extends McpAgent<Env, State, Props> {
       async (args, _toolCtx, env) => {
         const { owner, repo } = this.props;
         const baseHeaders: Record<string, string> = { "X-GitHub-Api-Version": "2022-11-28" };
-        if (env.GITHUB_TOKEN) baseHeaders.Authorization = `Bearer ${env.GITHUB_TOKEN}`;
+        if (MyMCP.GITHUB_TOKEN) baseHeaders.Authorization = `Bearer ${MyMCP.GITHUB_TOKEN}`;
 
         const out: Array<{ path: string; source_url: string; content: string }> = [];
 
