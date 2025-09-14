@@ -7,13 +7,13 @@ interface Env {
   GITHUB_TOKEN?: string;         // secret
 }
 
-/** single-user, minimal module state (unchanged) */
+/** single-user, minimal module state (kept like your template) */
 let OWNER = "";
 let REPO = "";
 let LIMIT = 5;
 let HEADERS: Record<string, string> = {};
 
-/** Helper shapes (no behavior change) */
+/** helper shapes */
 type SearchItem = { id: string; title: string; url: string };
 type Doc = {
   id: string;
@@ -30,21 +30,36 @@ export class MyMCP extends McpAgent {
   });
 
   async init() {
-  this.server.tool(
-    "search",
-    { query: z.string(), branch: z.string().optional() },
-    ({ query, branch }) => this.handleSearch(query, branch)
-  );
+    const SearchInput = z.object({
+      query: z.string().min(1, "query is required"),
+      branch: z.string().optional(),
+    });
 
-  this.server.tool(
-    "fetch",
-    { id: z.string(), branch: z.string().optional() },
-    ({ id, branch }) => this.handleFetch(id, branch)
-  );
-}
+    const FetchInput = z.object({
+      id: z.string().min(1, "id is required"),
+      branch: z.string().optional(),
+    });
 
+    this.server.tool(
+      "search",
+      SearchInput,
+      async ({ query, branch }) => {
+        const b = branch && branch.trim() ? branch.trim() : undefined;
+        return this.handleSearch(query, b);
+      }
+    );
 
-  /* ----------------- SINGLE-RESPONSIBILITY HELPERS ----------------- */
+    this.server.tool(
+      "fetch",
+      FetchInput,
+      async ({ id, branch }) => {
+        const b = branch && branch.trim() ? branch.trim() : undefined;
+        return this.handleFetch(id, b);
+      }
+    );
+  }
+
+  /* ----------------- helpers ----------------- */
 
   private repoScope(): string {
     return `repo:${OWNER}/${REPO}`;
@@ -60,35 +75,37 @@ export class MyMCP extends McpAgent {
     return `${base}${path}${q}`;
   }
 
-private async ghGet(url: string): Promise<any> {
-  const res = await fetch(url, { headers: HEADERS });
+  /** robust JSON-or-text fetch with clear errors */
+  private async ghGet(url: string): Promise<any> {
+    const res = await fetch(url, { headers: HEADERS });
+    const text = await res.text();
+    const ct = res.headers.get("content-type") || "";
 
-  // Read body once; we’ll decide how to interpret it.
-  const text = await res.text();
-  const ct = res.headers.get("content-type") || "";
+    if (!ct.includes("application/json")) {
+      const head = text.trim().slice(0, 300);
+      if (!res.ok) throw new Error(`GitHub ${res.status} ${res.statusText}: ${head}`);
+      try {
+        return JSON.parse(text);
+      } catch {
+        return head;
+      }
+    }
 
-  // Non-JSON body (e.g., "Request forbidden by administrative rules.")
-  if (!ct.includes("application/json")) {
-    const head = text.trim().slice(0, 300);
-    throw new Error(`GitHub ${res.status} ${res.statusText}: ${head}`);
+    let data: any;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      const head = text.trim().slice(0, 300);
+      throw new Error(`GitHub ${res.status} ${res.statusText}: ${head}`);
+    }
+
+    if (!res.ok) {
+      const msg = (data && (data.message || data.error)) || text.trim().slice(0, 300);
+      throw new Error(`GitHub ${res.status} ${res.statusText}: ${msg}`);
+    }
+
+    return data;
   }
-
-  // JSON body, but might still be an error
-  let data: any;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    const head = text.trim().slice(0, 300);
-    throw new Error(`GitHub ${res.status} ${res.statusText}: ${head}`);
-  }
-
-  if (!res.ok) {
-    const msg = (data && (data.message || data.error)) || text.trim().slice(0, 300);
-    throw new Error(`GitHub ${res.status} ${res.statusText}: ${msg}`);
-  }
-
-  return data;
-}
 
   private safeAtob(b64: string): string {
     try {
@@ -120,7 +137,7 @@ private async ghGet(url: string): Promise<any> {
   }
 
   private mapIssueItem(it: any): SearchItem | null {
-    if (!it) return null;
+    if (!it || it.number == null) return null;
     return {
       id: `issue:${it.number}`,
       title: it.title ?? `Issue #${it.number}`,
@@ -129,103 +146,68 @@ private async ghGet(url: string): Promise<any> {
   }
 
   private mapPrItem(it: any): SearchItem | null {
-    if (!it) return null;
-    return { id: `pr:${it.number}`, title: it.title ?? `PR #${it.number}`, url: it.html_url };
+    if (!it || it.number == null) return null;
+    return {
+      id: `pr:${it.number}`,
+      title: it.title ?? `PR #${it.number}`,
+      url: it.html_url,
+    };
   }
 
   private mapCommitItem(it: any): SearchItem | null {
     if (!it?.sha) return null;
-    const sha = it.sha as string;
-    const msg =
-      (it.commit?.message ?? "").split("\n")[0] || `Commit ${sha.slice(0, 7)}`;
-    return { id: `commit:${sha}`, title: msg, url: it.html_url };
+    const sha = String(it.sha);
+    const msg = (it.commit?.message ?? "").split("\n")[0] || `Commit ${sha.slice(0, 7)}`;
+    return { id: `commit:${sha}`, title: msg, url: it.html_url || `https://github.com/${OWNER}/${REPO}/commit/${sha}` };
   }
 
   private mapCodeItemFromSearch(it: any): SearchItem | null {
     if (!it?.sha) return null;
-    const sha = it.sha as string;
+    const sha = String(it.sha);
     const path = it.path ?? sha;
     return { id: `code:${sha}`, title: path, url: it.html_url };
   }
 
-  /** Map from a tree entry (branch-aware) */
   private mapCodeItemFromTree(entry: any, branch: string): SearchItem | null {
     if (!entry || entry.type !== "blob" || !entry.sha || !entry.path) return null;
-    const sha = entry.sha as string;
-    const path = entry.path as string;
-    const url = `https://github.com/${OWNER}/${REPO}/blob/${encodeURIComponent(
-      branch
-    )}/${encodeURI(path)}`;
+    const sha = String(entry.sha);
+    const path = String(entry.path);
+    const url = `https://github.com/${OWNER}/${REPO}/blob/${encodeURIComponent(branch)}/${encodeURI(path)}`;
     return { id: `code:${sha}`, title: path, url };
   }
-
-  private buildSearchResults(ji: any, jp: any, jc: any, jcode: any): SearchItem[] {
-    const results: SearchItem[] = [];
-    for (const it of ji.items ?? []) {
-      const x = this.mapIssueItem(it);
-      if (x) results.push(x);
-    }
-    for (const it of jp.items ?? []) {
-      const x = this.mapPrItem(it);
-      if (x) results.push(x);
-    }
-    for (const it of jc.items ?? []) {
-      const x = this.mapCommitItem(it);
-      if (x) results.push(x);
-    }
-    for (const it of jcode.items ?? []) {
-      const x = this.mapCodeItemFromSearch(it);
-      if (x) results.push(x);
-    }
-    return results;
-  }
-
-  /* ---------- Branch-aware helpers (only used when branch is provided) ---------- */
 
   private async resolveBranchHeadSha(branch: string): Promise<string | null> {
     const url = this.ghUrl(`/repos/${OWNER}/${REPO}/branches/${branch}`);
     const j = await this.ghGet(url);
-    return j?.commit?.sha ?? null;
+    const sha = j && j.commit && j.commit.sha ? String(j.commit.sha) : null;
+    return sha;
   }
 
-  private async searchCommitsOnBranch(
-    branch: string,
-    query: string
-  ): Promise<SearchItem[]> {
-    // fetch up to 100 recent commits on the branch, then filter by message
-    const url = this.ghUrl(`/repos/${OWNER}/${REPO}/commits`, {
-      sha: branch,
-      per_page: 100,
-    });
-    const commits = (await this.ghGet(url)) ?? [];
+  private async searchCommitsOnBranch(branch: string, query: string): Promise<SearchItem[]> {
+    const url = this.ghUrl(`/repos/${OWNER}/${REPO}/commits`, { sha: branch, per_page: 100 });
+    const commits = Array.isArray(await this.ghGet(url)) ? await this.ghGet(url) : [];
     const q = query.trim().toLowerCase();
-    const matches: SearchItem[] = [];
+    const out: SearchItem[] = [];
     for (const c of commits) {
-      const sha = c?.sha;
-      const msg = c?.commit?.message ?? "";
+      const sha = c && c.sha ? String(c.sha) : "";
       if (!sha) continue;
-      if (!q || msg.toLowerCase().includes(q) || String(sha).includes(q)) {
-        const title = (msg.split("\n")[0] || `Commit ${String(sha).slice(0, 7)}`) as string;
+      const msg = c.commit && c.commit.message ? String(c.commit.message) : "";
+      if (!q || msg.toLowerCase().includes(q) || sha.includes(q)) {
+        const title = msg.split("\n")[0] || `Commit ${sha.slice(0, 7)}`;
         const html = `https://github.com/${OWNER}/${REPO}/commit/${sha}`;
-        matches.push({ id: `commit:${sha}`, title, url: html });
-        if (matches.length >= LIMIT) break;
+        out.push({ id: `commit:${sha}`, title, url: html });
+        if (out.length >= LIMIT) break;
       }
     }
-    return matches;
+    return out;
   }
 
-  private async searchCodePathsOnBranch(
-    branch: string,
-    query: string
-  ): Promise<SearchItem[]> {
+  private async searchCodePathsOnBranch(branch: string, query: string): Promise<SearchItem[]> {
     const headSha = await this.resolveBranchHeadSha(branch);
     if (!headSha) return [];
-    const treeUrl = this.ghUrl(
-      `/repos/${OWNER}/${REPO}/git/trees/${headSha}`,
-      { recursive: 1 }
-    );
+    const treeUrl = this.ghUrl(`/repos/${OWNER}/${REPO}/git/trees/${headSha}`, { recursive: 1 });
     const tree = await this.ghGet(treeUrl);
-    const entries = tree?.tree ?? [];
+    const entries = Array.isArray(tree?.tree) ? tree.tree : [];
     const q = query.trim().toLowerCase();
     const results: SearchItem[] = [];
     for (const e of entries) {
@@ -240,74 +222,98 @@ private async ghGet(url: string): Promise<any> {
     return results;
   }
 
-  /* ----------------- TOOL HANDLERS ----------------- */
+  /* ----------------- tool handlers ----------------- */
 
   private async handleSearch(query: string, branch?: string) {
-    if (branch) {
-      // Branch-aware mode for commits & code; issues/PRs unchanged
-      const baseQ = this.repoScope();
-      const issuesURL = this.ghUrl("/search/issues", {
-        q: `${baseQ} is:issue ${query}`,
-        per_page: String(LIMIT),
-      });
-      const prsURL = this.ghUrl("/search/issues", {
-        q: `${baseQ} is:pr ${query}`,
-        per_page: String(LIMIT),
-      });
+    try {
+      if (branch) {
+        const baseQ = this.repoScope();
+        const issuesURL = this.ghUrl("/search/issues", {
+          q: `${baseQ} is:issue ${query}`,
+          per_page: String(LIMIT),
+        });
+        const prsURL = this.ghUrl("/search/issues", {
+          q: `${baseQ} is:pr ${query}`,
+          per_page: String(LIMIT),
+        });
 
-      const [ji, jp, commitItems, codeItems] = await Promise.all([
+        const [ji, jp, commitItems, codeItems] = await Promise.all([
+          this.ghGet(issuesURL),
+          this.ghGet(prsURL),
+          this.searchCommitsOnBranch(branch, query),
+          this.searchCodePathsOnBranch(branch, query),
+        ]);
+
+        const results: SearchItem[] = [];
+        for (const it of ji?.items ?? []) {
+          const x = this.mapIssueItem(it);
+          if (x) results.push(x);
+        }
+        for (const it of jp?.items ?? []) {
+          const x = this.mapPrItem(it);
+          if (x) results.push(x);
+        }
+        results.push(...commitItems);
+        results.push(...codeItems);
+
+        return { content: [{ type: "text", text: JSON.stringify({ results }) }] };
+      }
+
+      const { issuesURL, prsURL, commitsURL, codeURL } = this.buildSearchUrls(query);
+      const [ri, rp, rc, rcode] = await Promise.all([
         this.ghGet(issuesURL),
         this.ghGet(prsURL),
-        this.searchCommitsOnBranch(branch, query),
-        this.searchCodePathsOnBranch(branch, query),
+        this.ghGet(commitsURL),
+        this.ghGet(codeURL),
       ]);
-
-      // Compose in the same category order
       const results: SearchItem[] = [];
-      for (const it of ji.items ?? []) {
+      for (const it of ri?.items ?? []) {
         const x = this.mapIssueItem(it);
         if (x) results.push(x);
       }
-      for (const it of jp.items ?? []) {
+      for (const it of rp?.items ?? []) {
         const x = this.mapPrItem(it);
         if (x) results.push(x);
       }
-      results.push(...commitItems);
-      results.push(...codeItems);
+      for (const it of rc?.items ?? []) {
+        const x = this.mapCommitItem(it);
+        if (x) results.push(x);
+      }
+      for (const it of rcode?.items ?? []) {
+        const x = this.mapCodeItemFromSearch(it);
+        if (x) results.push(x);
+      }
 
       return { content: [{ type: "text", text: JSON.stringify({ results }) }] };
+    } catch (err: any) {
+      const error = String(err?.message || err);
+      return { content: [{ type: "text", text: JSON.stringify({ error }) }] };
     }
-
-    // Default behavior (unchanged): Search API (default branch for commits/code)
-    const { issuesURL, prsURL, commitsURL, codeURL } = this.buildSearchUrls(query);
-    const [ri, rp, rc, rcode] = await Promise.all([
-      this.ghGet(issuesURL),
-      this.ghGet(prsURL),
-      this.ghGet(commitsURL),
-      this.ghGet(codeURL),
-    ]);
-    const results = this.buildSearchResults(ri, rp, rc, rcode);
-    return { content: [{ type: "text", text: JSON.stringify({ results }) }] };
   }
 
   private async handleFetch(id: string, branch?: string) {
-    // Note: branch currently does not change fetch behavior for these ID forms.
-    // (commit SHA/blob SHA are branch-agnostic; issues/PRs are not branch-scoped.)
-    const [kind, value] = id.split(":");
-    let doc: Doc;
+    try {
+      const [kind, value] = id.split(":");
+      let doc: Doc;
 
-    if (kind === "issue")      doc = await this.fetchIssue(value);
-    else if (kind === "pr")    doc = await this.fetchPr(value);
-    else if (kind === "commit")doc = await this.fetchCommit(value);
-    else if (kind === "code")  doc = await this.fetchCodeBlob(value);
-    else {
-      doc = { id, title: "Unknown ID", text: "Use: issue, pr, commit, or code", url: "", metadata: {} };
+      if (kind === "issue") {
+        doc = await this.fetchIssue(value);
+      } else if (kind === "pr") {
+        doc = await this.fetchPr(value);
+      } else if (kind === "commit") {
+        doc = await this.fetchCommit(value);
+      } else if (kind === "code") {
+        doc = await this.fetchCodeBlob(value);
+      } else {
+        doc = { id, title: "Unknown ID", text: "Use: issue, pr, commit, or code", url: "", metadata: {} };
+      }
+
+      return { content: [{ type: "text", text: JSON.stringify(doc) }] };
+    } catch (err: any) {
+      const error = String(err?.message || err);
+      return { content: [{ type: "text", text: JSON.stringify({ error }) }] };
     }
-
-    return { content: [{ type: "text", text: JSON.stringify(doc) }] };
   }
-
-  /* ---------- Per-kind fetchers (unchanged behavior) ---------- */
 
   private async fetchIssue(value: string): Promise<Doc> {
     const url = this.ghUrl(`/repos/${OWNER}/${REPO}/issues/${value}`);
@@ -350,8 +356,7 @@ private async ghGet(url: string): Promise<any> {
   private async fetchCodeBlob(value: string): Promise<Doc> {
     const url = this.ghUrl(`/repos/${OWNER}/${REPO}/git/blobs/${value}`);
     const j = await this.ghGet(url);
-    const text =
-      j?.encoding === "base64" && j?.content ? this.safeAtob(String(j.content)) : "";
+    const text = j?.encoding === "base64" && j?.content ? this.safeAtob(String(j.content)) : "";
     return {
       id: `code:${value}`,
       title: `blob ${value}`,
@@ -362,7 +367,7 @@ private async ghGet(url: string): Promise<any> {
   }
 }
 
-/** worker entry — unchanged routes, still under /:owner/:repo/ */
+/** worker entry — same routes, module state set per request */
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
     const url = new URL(request.url);
@@ -381,7 +386,11 @@ export default {
     const n = parseInt(raw, 10);
     LIMIT = Number.isFinite(n) && n > 0 ? n : 5;
 
-    HEADERS = { Accept: "application/vnd.github+json", "User-Agent": "mcp-server" };
+    HEADERS = {
+      Accept: "application/vnd.github+json",
+      "User-Agent": "mcp-server",
+      "X-GitHub-Api-Version": "2022-11-28",
+    };
     if (env.GITHUB_TOKEN) HEADERS.Authorization = `Bearer ${env.GITHUB_TOKEN}`;
 
     const prefix = `/${OWNER}/${REPO}`;
