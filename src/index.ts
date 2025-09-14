@@ -9,20 +9,20 @@ type Doc = { id: string; title: string; text: string; url: string; metadata?: Re
 export class MyMCP extends McpAgent {
   server = new McpServer({ name: "GitHub Repo MCP", version: "1.0.0" });
 
-  async init() {
-    // simplest, clean param exposure — default branch only
-    this.server.tool(
-      "search",
-      { query: z.string() },
-      ({ query }) => this.handleSearch(query)
-    );
+ async init() {
+  // EXACTLY like your original contract: string in, string in
+  this.server.tool(
+    "search",
+    z.string(),
+    (query: string) => this.handleSearch(query)
+  );
 
-    this.server.tool(
-      "fetch",
-      { id: z.string() },
-      ({ id }) => this.handleFetch(id)
-    );
-  }
+  this.server.tool(
+    "fetch",
+    z.string(),
+    (id: string) => this.handleFetch(id)
+  );
+}
 
   /* ----------------- tiny helpers (SRP + DRY) ----------------- */
 
