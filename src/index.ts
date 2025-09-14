@@ -134,7 +134,7 @@ export default {
     (ctx as any).props = { owner, repo };
 
     return mode === "sse"
-      ? GitHubRepoAdapter.serveSSE(base).fetch(request, env, ctx)
-      : GitHubRepoAdapter.serve(base).fetch(request, env, ctx);
+      ? MyMCP.serveSSE(base).fetch(request, env, ctx)
+      : MyMCP.serve(base).fetch(request, env, ctx);
   },
 };
